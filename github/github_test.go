@@ -7,14 +7,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-github/v32/github"
+	"github.com/google/go-github/v33/github"
 	"github.com/summerwind/actions-runner-controller/github/fake"
 )
 
 var server *httptest.Server
 
 func newTestClient() *Client {
-	client, err := NewClientWithAccessToken("token")
+	c := Config{
+		Token: "token",
+	}
+	client, err := c.NewClient()
 	if err != nil {
 		panic(err)
 	}

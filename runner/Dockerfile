@@ -1,7 +1,7 @@
 FROM ubuntu:18.04
 
 ARG TARGETPLATFORM
-ARG RUNNER_VERSION=2.272.0
+ARG RUNNER_VERSION=2.274.2
 ARG DOCKER_VERSION=19.03.12
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -50,10 +50,16 @@ RUN export ARCH=$(echo ${TARGETPLATFORM} | cut -d / -f2) \
   && install -o root -g root -m 755 docker/docker /usr/local/bin/docker \
   && rm -rf docker docker.tgz \
   && adduser --disabled-password --gecos "" --uid 1000 runner \
+  && groupadd docker \
   && usermod -aG sudo runner \
+  && usermod -aG docker runner \
   && echo "%sudo   ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers
 
-# Runner download supports amd64 as x64
+# Runner download supports amd64 as x64. Externalstmp is needed for making mount points work inside DinD.
+#
+# libyaml-dev is required for ruby/setup-ruby action.
+# It is installed after installdependencies.sh and before removing /var/lib/apt/lists
+# to avoid rerunning apt-update on its own.
 RUN export ARCH=$(echo ${TARGETPLATFORM} | cut -d / -f2) \
   && if [ "$ARCH" = "amd64" ]; then export ARCH=x64 ; fi \
   && mkdir -p /runner \
@@ -62,11 +68,18 @@ RUN export ARCH=$(echo ${TARGETPLATFORM} | cut -d / -f2) \
   && tar xzf ./runner.tar.gz \
   && rm runner.tar.gz \
   && ./bin/installdependencies.sh \
+  && mv ./externals ./externalstmp \
+  && apt-get install -y libyaml-dev \
   && rm -rf /var/lib/apt/lists/*
+
+RUN echo AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache > /runner.env \
+  && mkdir /opt/hostedtoolcache \
+  && chgrp runner /opt/hostedtoolcache \
+  && chmod g+rwx /opt/hostedtoolcache
 
 COPY entrypoint.sh /runner
 COPY patched /runner/patched
 
-USER runner:runner
+USER runner
 ENTRYPOINT ["/usr/local/bin/dumb-init", "--"]
 CMD ["/runner/entrypoint.sh"]

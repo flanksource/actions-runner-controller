@@ -4,48 +4,76 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation"
-	"github.com/google/go-github/v32/github"
+	"github.com/google/go-github/v33/github"
 	"golang.org/x/oauth2"
 )
+
+// Config contains configuration for Github client
+type Config struct {
+	EnterpriseURL     string `split_words:"true"`
+	AppID             int64  `split_words:"true"`
+	AppInstallationID int64  `split_words:"true"`
+	AppPrivateKey     string `split_words:"true"`
+	Token             string
+}
 
 // Client wraps GitHub client with some additional
 type Client struct {
 	*github.Client
 	regTokens map[string]*github.RegistrationToken
 	mu        sync.Mutex
+	// GithubBaseURL to Github without API suffix.
+	GithubBaseURL string
 }
 
-// NewClient returns a client authenticated as a GitHub App.
-func NewClient(appID, installationID int64, privateKeyPath string) (*Client, error) {
-	tr, err := ghinstallation.NewKeyFromFile(http.DefaultTransport, appID, installationID, privateKeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("authentication failed: %v", err)
+// NewClient creates a Github Client
+func (c *Config) NewClient() (*Client, error) {
+	var (
+		httpClient *http.Client
+		client     *github.Client
+	)
+	githubBaseURL := "https://github.com/"
+	if len(c.Token) > 0 {
+		httpClient = oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
+			&oauth2.Token{AccessToken: c.Token},
+		))
+	} else {
+		tr, err := ghinstallation.NewKeyFromFile(http.DefaultTransport, c.AppID, c.AppInstallationID, c.AppPrivateKey)
+		if err != nil {
+			return nil, fmt.Errorf("authentication failed: %v", err)
+		}
+		if len(c.EnterpriseURL) > 0 {
+			githubAPIURL, err := getEnterpriseApiUrl(c.EnterpriseURL)
+			if err != nil {
+				return nil, fmt.Errorf("enterprise url incorrect: %v", err)
+			}
+			tr.BaseURL = githubAPIURL
+		}
+		httpClient = &http.Client{Transport: tr}
 	}
 
-	gh := github.NewClient(&http.Client{Transport: tr})
+	if len(c.EnterpriseURL) > 0 {
+		var err error
+		client, err = github.NewEnterpriseClient(c.EnterpriseURL, c.EnterpriseURL, httpClient)
+		if err != nil {
+			return nil, fmt.Errorf("enterprise client creation failed: %v", err)
+		}
+		githubBaseURL = fmt.Sprintf("%s://%s%s", client.BaseURL.Scheme, client.BaseURL.Host, strings.TrimSuffix(client.BaseURL.Path, "api/v3/"))
+	} else {
+		client = github.NewClient(httpClient)
+	}
 
 	return &Client{
-		Client:    gh,
-		regTokens: map[string]*github.RegistrationToken{},
-		mu:        sync.Mutex{},
-	}, nil
-}
-
-// NewClientWithAccessToken returns a client authenticated with personal access token.
-func NewClientWithAccessToken(token string) (*Client, error) {
-	tc := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
-	))
-
-	return &Client{
-		Client:    github.NewClient(tc),
-		regTokens: map[string]*github.RegistrationToken{},
-		mu:        sync.Mutex{},
+		Client:        client,
+		regTokens:     map[string]*github.RegistrationToken{},
+		mu:            sync.Mutex{},
+		GithubBaseURL: githubBaseURL,
 	}, nil
 }
 
@@ -57,7 +85,7 @@ func (c *Client) GetRegistrationToken(ctx context.Context, org, repo, name strin
 	key := getRegistrationKey(org, repo)
 	rt, ok := c.regTokens[key]
 
-	if ok && rt.GetExpiresAt().After(time.Now().Add(-10*time.Minute)) {
+	if ok && rt.GetExpiresAt().After(time.Now()) {
 		return rt, nil
 	}
 
@@ -152,25 +180,25 @@ func (c *Client) cleanup() {
 func (c *Client) createRegistrationToken(ctx context.Context, owner, repo string) (*github.RegistrationToken, *github.Response, error) {
 	if len(repo) > 0 {
 		return c.Client.Actions.CreateRegistrationToken(ctx, owner, repo)
-	} else {
-		return CreateOrganizationRegistrationToken(ctx, c, owner)
 	}
+
+	return CreateOrganizationRegistrationToken(ctx, c, owner)
 }
 
 func (c *Client) removeRunner(ctx context.Context, owner, repo string, runnerID int64) (*github.Response, error) {
 	if len(repo) > 0 {
 		return c.Client.Actions.RemoveRunner(ctx, owner, repo, runnerID)
-	} else {
-		return RemoveOrganizationRunner(ctx, c, owner, runnerID)
 	}
+
+	return RemoveOrganizationRunner(ctx, c, owner, runnerID)
 }
 
 func (c *Client) listRunners(ctx context.Context, owner, repo string, opts *github.ListOptions) (*github.Runners, *github.Response, error) {
 	if len(repo) > 0 {
 		return c.Client.Actions.ListRunners(ctx, owner, repo, opts)
-	} else {
-		return ListOrganizationRunners(ctx, c, owner, opts)
 	}
+
+	return ListOrganizationRunners(ctx, c, owner, opts)
 }
 
 // Validates owner and repo arguments. Both are optional, but at least one should be specified
@@ -187,9 +215,8 @@ func getOwnerAndRepo(org, repo string) (string, string, error) {
 func getRegistrationKey(org, repo string) string {
 	if len(org) > 0 {
 		return org
-	} else {
-		return repo
 	}
+	return repo
 }
 
 func splitOwnerAndRepo(repo string) (string, string, error) {
@@ -198,4 +225,22 @@ func splitOwnerAndRepo(repo string) (string, string, error) {
 		return "", "", fmt.Errorf("invalid repository name: '%s'", repo)
 	}
 	return chunk[0], chunk[1], nil
+}
+
+func getEnterpriseApiUrl(baseURL string) (string, error) {
+	baseEndpoint, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasSuffix(baseEndpoint.Path, "/") {
+		baseEndpoint.Path += "/"
+	}
+	if !strings.HasSuffix(baseEndpoint.Path, "/api/v3/") &&
+		!strings.HasPrefix(baseEndpoint.Host, "api.") &&
+		!strings.Contains(baseEndpoint.Host, ".api.") {
+		baseEndpoint.Path += "api/v3/"
+	}
+
+	// Trim trailing slash, otherwise there's double slash added to token endpoint
+	return fmt.Sprintf("%s://%s%s", baseEndpoint.Scheme, baseEndpoint.Host, strings.TrimSuffix(baseEndpoint.Path, "/")), nil
 }

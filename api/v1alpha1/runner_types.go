@@ -37,7 +37,12 @@ type RunnerSpec struct {
 	Labels []string `json:"labels,omitempty"`
 
 	// +optional
+	Group string `json:"group,omitempty"`
+
+	// +optional
 	Containers []corev1.Container `json:"containers,omitempty"`
+	// +optional
+	DockerdContainerResources corev1.ResourceRequirements `json:"dockerdContainerResources,omitempty"`
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 	// +optional
@@ -54,6 +59,8 @@ type RunnerSpec struct {
 
 	// +optional
 	Volumes []corev1.Volume `json:"volumes,omitempty"`
+	// +optional
+	WorkDir string `json:"workDir,omitempty"`
 
 	// +optional
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
@@ -78,7 +85,9 @@ type RunnerSpec struct {
 	// +optional
 	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 	// +optional
-	DockerWithinRunnerContainer *bool `json:"dockerWithinRunnerContainer,omitempty"`
+	DockerdWithinRunnerContainer *bool `json:"dockerdWithinRunnerContainer,omitempty"`
+	// +optional
+	DockerEnabled *bool `json:"dockerEnabled,omitempty"`
 }
 
 // ValidateRepository validates repository field.

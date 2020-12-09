@@ -19,7 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"reflect"
+	"github.com/summerwind/actions-runner-controller/hash"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -39,6 +39,8 @@ import (
 const (
 	containerName = "runner"
 	finalizerName = "runner.actions.summerwind.dev"
+
+	LabelKeyPodTemplateHash = "pod-template-hash"
 )
 
 // RunnerReconciler reconciles a Runner object
@@ -120,37 +122,16 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		return ctrl.Result{}, nil
 	}
 
-	if !runner.IsRegisterable() {
-		rt, err := r.GitHubClient.GetRegistrationToken(ctx, runner.Spec.Organization, runner.Spec.Repository, runner.Name)
-		if err != nil {
-			r.Recorder.Event(&runner, corev1.EventTypeWarning, "FailedUpdateRegistrationToken", "Updating registration token failed")
-			log.Error(err, "Failed to get new registration token")
-			return ctrl.Result{}, err
-		}
-
-		updated := runner.DeepCopy()
-		updated.Status.Registration = v1alpha1.RunnerStatusRegistration{
-			Organization: runner.Spec.Organization,
-			Repository:   runner.Spec.Repository,
-			Labels:       runner.Spec.Labels,
-			Token:        rt.GetToken(),
-			ExpiresAt:    metav1.NewTime(rt.GetExpiresAt().Time),
-		}
-
-		if err := r.Status().Update(ctx, updated); err != nil {
-			log.Error(err, "Failed to update runner status")
-			return ctrl.Result{}, err
-		}
-
-		r.Recorder.Event(&runner, corev1.EventTypeNormal, "RegistrationTokenUpdated", "Successfully update registration token")
-		log.Info("Updated registration token", "repository", runner.Spec.Repository)
-		return ctrl.Result{}, nil
-	}
-
 	var pod corev1.Pod
 	if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
 		if !errors.IsNotFound(err) {
 			return ctrl.Result{}, err
+		}
+
+		if updated, err := r.updateRegistrationToken(ctx, runner); err != nil {
+			return ctrl.Result{}, err
+		} else if updated {
+			return ctrl.Result{Requeue: true}, nil
 		}
 
 		newPod, err := r.newPod(runner)
@@ -167,7 +148,11 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 		r.Recorder.Event(&runner, corev1.EventTypeNormal, "PodCreated", fmt.Sprintf("Created pod '%s'", newPod.Name))
 		log.Info("Created runner pod", "repository", runner.Spec.Repository)
 	} else {
-		if runner.Status.Phase != string(pod.Status.Phase) {
+		// If pod has ended up succeeded we need to restart it
+		// Happens e.g. when dind is in runner and run completes
+		restart := pod.Status.Phase == corev1.PodSucceeded
+
+		if !restart && runner.Status.Phase != string(pod.Status.Phase) {
 			updated := runner.DeepCopy()
 			updated.Status.Phase = string(pod.Status.Phase)
 			updated.Status.Reason = pod.Status.Reason
@@ -185,8 +170,6 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			return ctrl.Result{}, err
 		}
 
-		restart := false
-
 		if pod.Status.Phase == corev1.PodRunning {
 			for _, status := range pod.Status.ContainerStatuses {
 				if status.Name != containerName {
@@ -197,6 +180,12 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 					restart = true
 				}
 			}
+		}
+
+		if updated, err := r.updateRegistrationToken(ctx, runner); err != nil {
+			return ctrl.Result{}, err
+		} else if updated {
+			return ctrl.Result{Requeue: true}, nil
 		}
 
 		newPod, err := r.newPod(runner)
@@ -211,14 +200,21 @@ func (r *RunnerReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			return ctrl.Result{}, nil
 		}
 
-		if !runnerBusy && (!reflect.DeepEqual(pod.Spec.Containers[0].Env, newPod.Spec.Containers[0].Env) || pod.Spec.Containers[0].Image != newPod.Spec.Containers[0].Image) {
+		// See the `newPod` function called above for more information
+		// about when this hash changes.
+		curHash := pod.Labels[LabelKeyPodTemplateHash]
+		newHash := newPod.Labels[LabelKeyPodTemplateHash]
+
+		if !runnerBusy && curHash != newHash {
 			restart = true
 		}
 
+		// Don't do anything if there's no need to restart the runner
 		if !restart {
 			return ctrl.Result{}, err
 		}
 
+		// Delete current pod if recreation is needed
 		if err := r.Delete(ctx, &pod); err != nil {
 			log.Error(err, "Failed to delete pod resource")
 			return ctrl.Result{}, err
@@ -274,15 +270,55 @@ func (r *RunnerReconciler) unregisterRunner(ctx context.Context, org, repo, name
 	return true, nil
 }
 
+func (r *RunnerReconciler) updateRegistrationToken(ctx context.Context, runner v1alpha1.Runner) (bool, error) {
+	if runner.IsRegisterable() {
+		return false, nil
+	}
+
+	log := r.Log.WithValues("runner", runner.Name)
+
+	rt, err := r.GitHubClient.GetRegistrationToken(ctx, runner.Spec.Organization, runner.Spec.Repository, runner.Name)
+	if err != nil {
+		r.Recorder.Event(&runner, corev1.EventTypeWarning, "FailedUpdateRegistrationToken", "Updating registration token failed")
+		log.Error(err, "Failed to get new registration token")
+		return false, err
+	}
+
+	updated := runner.DeepCopy()
+	updated.Status.Registration = v1alpha1.RunnerStatusRegistration{
+		Organization: runner.Spec.Organization,
+		Repository:   runner.Spec.Repository,
+		Labels:       runner.Spec.Labels,
+		Token:        rt.GetToken(),
+		ExpiresAt:    metav1.NewTime(rt.GetExpiresAt().Time),
+	}
+
+	if err := r.Status().Update(ctx, updated); err != nil {
+		log.Error(err, "Failed to update runner status")
+		return false, err
+	}
+
+	r.Recorder.Event(&runner, corev1.EventTypeNormal, "RegistrationTokenUpdated", "Successfully update registration token")
+	log.Info("Updated registration token", "repository", runner.Spec.Repository)
+
+	return true, nil
+}
+
 func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 	var (
 		privileged      bool = true
-		dockerdInRunner bool = runner.Spec.DockerWithinRunnerContainer != nil && *runner.Spec.DockerWithinRunnerContainer
+		dockerdInRunner bool = runner.Spec.DockerdWithinRunnerContainer != nil && *runner.Spec.DockerdWithinRunnerContainer
+		dockerEnabled   bool = runner.Spec.DockerEnabled == nil || *runner.Spec.DockerEnabled
 	)
 
 	runnerImage := runner.Spec.Image
 	if runnerImage == "" {
 		runnerImage = r.RunnerImage
+	}
+
+	workDir := runner.Spec.WorkDir
+	if workDir == "" {
+		workDir = "/runner/_work"
 	}
 
 	runnerImagePullPolicy := runner.Spec.ImagePullPolicy
@@ -308,6 +344,10 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 			Value: strings.Join(runner.Spec.Labels, ","),
 		},
 		{
+			Name:  "RUNNER_GROUP",
+			Value: runner.Spec.Group,
+		},
+		{
 			Name:  "RUNNER_TOKEN",
 			Value: runner.Status.Registration.Token,
 		},
@@ -315,14 +355,55 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 			Name:  "DOCKERD_IN_RUNNER",
 			Value: fmt.Sprintf("%v", dockerdInRunner),
 		},
+		{
+			Name:  "GITHUB_URL",
+			Value: r.GitHubClient.GithubBaseURL,
+		},
+		{
+			Name:  "RUNNER_WORKDIR",
+			Value: workDir,
+		},
 	}
 
 	env = append(env, runner.Spec.Env...)
+
+	labels := map[string]string{}
+
+	for k, v := range runner.Labels {
+		labels[k] = v
+	}
+
+	// This implies that...
+	//
+	// (1) We recreate the runner pod whenever the runner has changes in:
+	// - metadata.labels (excluding "runner-template-hash" added by the parent RunnerReplicaSet
+	// - metadata.annotations
+	// - metadata.spec (including image, env, organization, repository, group, and so on)
+	// - GithubBaseURL setting of the controller (can be configured via GITHUB_ENTERPRISE_URL)
+	//
+	// (2) We don't recreate the runner pod when there are changes in:
+	// - runner.status.registration.token
+	//   - This token expires and changes hourly, but you don't need to recreate the pod due to that.
+	//     It's the opposite.
+	//     An unexpired token is required only when the runner agent is registering itself on launch.
+	//
+	//     In other words, the registered runner doesn't get invalidated on registration token expiration.
+	//     A registered runner's session and the a registration token seem to have two different and independent
+	//     lifecycles.
+	//
+	//     See https://github.com/summerwind/actions-runner-controller/issues/143 for more context.
+	labels[LabelKeyPodTemplateHash] = hash.FNVHashStringObjects(
+		filterLabels(runner.Labels, LabelKeyRunnerTemplateHash),
+		runner.Annotations,
+		runner.Spec,
+		r.GitHubClient.GithubBaseURL,
+	)
+
 	pod := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        runner.Name,
 			Namespace:   runner.Namespace,
-			Labels:      runner.Labels,
+			Labels:      labels,
 			Annotations: runner.Annotations,
 		},
 		Spec: corev1.PodSpec{
@@ -336,7 +417,7 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 					EnvFrom:         runner.Spec.EnvFrom,
 					SecurityContext: &corev1.SecurityContext{
 						// Runner need to run privileged if it contains DinD
-						Privileged: runner.Spec.DockerWithinRunnerContainer,
+						Privileged: runner.Spec.DockerdWithinRunnerContainer,
 					},
 					Resources: runner.Spec.Resources,
 				},
@@ -344,7 +425,7 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 		},
 	}
 
-	if !dockerdInRunner {
+	if !dockerdInRunner && dockerEnabled {
 		pod.Spec.Volumes = []corev1.Volume{
 			{
 				Name: "work",
@@ -353,7 +434,13 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 				},
 			},
 			{
-				Name: "docker",
+				Name: "externals",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+			{
+				Name: "certs-client",
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
@@ -362,24 +449,53 @@ func (r *RunnerReconciler) newPod(runner v1alpha1.Runner) (corev1.Pod, error) {
 		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
 			{
 				Name:      "work",
-				MountPath: "/runner/_work",
+				MountPath: workDir,
 			},
 			{
-				Name:      "docker",
-				MountPath: "/var/run",
+				Name:      "externals",
+				MountPath: "/runner/externals",
+			},
+			{
+				Name:      "certs-client",
+				MountPath: "/certs/client",
+				ReadOnly:  true,
 			},
 		}
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, []corev1.EnvVar{
+			{
+				Name:  "DOCKER_HOST",
+				Value: "tcp://localhost:2376",
+			},
+			{
+				Name:  "DOCKER_TLS_VERIFY",
+				Value: "1",
+			},
+			{
+				Name:  "DOCKER_CERT_PATH",
+				Value: "/certs/client",
+			},
+		}...)
 		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
 			Name:  "docker",
 			Image: r.DockerImage,
 			VolumeMounts: []corev1.VolumeMount{
 				{
 					Name:      "work",
-					MountPath: "/runner/_work",
+					MountPath: workDir,
 				},
 				{
-					Name:      "docker",
-					MountPath: "/var/run",
+					Name:      "externals",
+					MountPath: "/runner/externals",
+				},
+				{
+					Name:      "certs-client",
+					MountPath: "/certs/client",
+				},
+			},
+			Env: []corev1.EnvVar{
+				{
+					Name:  "DOCKER_TLS_CERTDIR",
+					Value: "/certs",
 				},
 			},
 			SecurityContext: &corev1.SecurityContext{
