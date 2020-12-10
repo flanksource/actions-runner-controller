@@ -6,6 +6,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     name: Release
+    env:
+      DOCKERHUB_USERNAME: ${{ github.repository_owner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -22,7 +24,7 @@ jobs:
           sudo mv ghr_v0.13.0_linux_amd64/ghr /usr/local/bin
 
       - name: Set version
-        run: echo "::set-env name=VERSION::$(cat ${GITHUB_EVENT_PATH} | jq -r '.release.tag_name')"
+        run: echo "VERSION=$(cat ${GITHUB_EVENT_PATH} | jq -r '.release.tag_name')" >> $GITHUB_ENV
 
       - name: Override NAME for flanksource publication
         run: echo "::set-env name=NAME::flanksource/actions-runner-controller"
@@ -32,11 +34,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: make github-release
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+
       - name: Set up Docker Buildx
         id: buildx
-        uses: crazy-max/ghaction-docker-buildx@v1
+        uses: docker/setup-buildx-action@v1
         with:
-          buildx-version: latest
+          version: latest
 
       - name: Login to GitHub Docker Registry
         run: echo "${DOCKERHUB_PASSWORD}" | docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
