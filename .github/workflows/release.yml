@@ -27,7 +27,7 @@ jobs:
         run: echo "VERSION=$(cat ${GITHUB_EVENT_PATH} | jq -r '.release.tag_name')" >> $GITHUB_ENV
 
       - name: Override NAME for flanksource publication
-        run: echo "::set-env name=NAME::flanksource/actions-runner-controller"
+        run: echo "NAME=flanksource/actions-runner-controller" >> $GITHUB_ENV
 
       - name: Upload artifacts
         env:
